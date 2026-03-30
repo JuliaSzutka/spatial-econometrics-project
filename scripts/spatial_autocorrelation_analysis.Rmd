@@ -1,0 +1,429 @@
+```{r}
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(car)
+library(lmtest)
+library(tseries)
+library(rlang) 
+library(ggplot2)
+library(strucchange)
+library(sandwich)
+library(tidyverse)
+library(lmtest)
+library(spdep)
+library(sf)
+library(spatialreg)
+set.seed(123)
+```
+
+#Wczytanie danych
+```{r}
+df_bezrobocie <- read.csv("stopa_bezrobocia_pow.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_bezrobocie <- df_bezrobocie %>%
+  filter(grepl("^Powiat", Nazwa))
+df_wynagrodzenia <- read.csv("wynagrodzenia.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_przedszkola <- read.csv("przedszkola.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_migracje <- read.csv("migracje.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_feminizacja <- read.csv("feminizacja.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_wspolczynnik_urbanizacji <- read.csv("urbanizacja.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+df_ludnosc <- read.csv("ludnosc_tys.csv", sep=";", stringsAsFactors = FALSE, dec = ",")
+
+dfs <- list(
+  df_bezrobocie %>% rename(stopa_bezrobocia = ogółem.2023....),
+  df_wynagrodzenia %>% rename(wynagrodzenie_brutto = ogółem.2023..zł.),
+  df_przedszkola %>% rename(dzieci_na_placowke = dzieci.w.wieku.3.5.lat.przypadająca.na.jedną.placówkę.wychowania.przedszkolnego.2023..osoba.),
+  df_migracje %>% rename(saldo_migracji = saldo.migracji.ogółem.2023..osoba.),
+  df_feminizacja %>% rename(wspolczynnik_feminizacji = ogółem.2023..osoba.),
+  df_wspolczynnik_urbanizacji %>% rename(wspolczynnik_urbanizacji = rok.2023....),
+  df_ludnosc %>% rename(ludnosc_tys = ludność.w.tysiącach.2023..tys..osób.)
+)
+
+
+# połączenie wszystkich po kolumnie Kod
+df_final <- purrr::reduce(dfs, left_join, by = "Kod") %>% dplyr::select(Kod, Nazwa, stopa_bezrobocia, wynagrodzenie_brutto, dzieci_na_placowke, saldo_migracji, wspolczynnik_feminizacji, wspolczynnik_urbanizacji, ludnosc_tys)
+```
+
+Przeliczenie salda migracji na saldo_migracji/tys. ludności
+```{r}
+df_final <- df_final %>% mutate(saldo_migracji_na_tys=saldo_migracji/ludnosc_tys) %>% dplyr::select(-saldo_migracji, - ludnosc_tys)
+```
+
+```{r}
+powiaty <- st_read("powiaty.shp")
+powiaty <- powiaty %>% rename(Nazwa=JPT_NAZWA_)
+powiaty$Nazwa <- toupper(powiaty$Nazwa)
+
+powiaty$Kod <- paste0(as.character(as.integer(powiaty$JPT_KOD_JE)), "000")
+df_final$Kod <- as.character(df_final$Kod)
+```
+
+
+
+Sprawdzenie braków
+```{r}
+colSums(df_final == 0, na.rm = TRUE)
+colSums(is.na(df_final), na.rm = TRUE)
+
+#sprawdzenie dla jakich powiatów
+df_final$Nazwa[df_final$wynagrodzenie_brutto==0]
+df_final$Nazwa[is.na(df_final$wspolczynnik_urbanizacji)]
+
+```
+W zmiennej wynagrodzenie_brutto Powiat m. Jastrzębie-Zdrój (wartosc 0)
+Brak danych w wspolczynnik_urbanizacji Powiat suwalski (NA)
+
+Imputacja danych KNN - 5 sąsiadów
+```{r}
+#install.packages("VIM")
+library(VIM)
+
+df_final$wynagrodzenie_brutto[df_final$wynagrodzenie_brutto == 0] <- NA
+df_imputed <- kNN(df_final, k = 5)
+
+df_final <- df_imputed[,1:8]
+sum(is.na(df_final))
+```
+
+Statystyki przed zmodyfikowaniem outlierów
+```{r}
+library(psych)
+
+describe(df_final[,3:8])
+```
+```{r}
+df_final_spatial <- powiaty %>%
+  left_join(df_final, by = "Kod")
+
+df_final_spatial <- df_final_spatial[match(df_final$Kod, df_final_spatial$Kod), ]
+all(df_final_spatial$Kod == df_final$Kod)  # TRUE jeśli kolejność pasuje
+```
+
+Histogramy
+```{r}
+data <- df_final_spatial %>% 
+  st_drop_geometry()  # usuwa kolumnę geometry
+
+df_long_hist <- data %>%
+    dplyr::select(stopa_bezrobocia, wynagrodzenie_brutto, dzieci_na_placowke, 
+           wspolczynnik_feminizacji, wspolczynnik_urbanizacji, saldo_migracji_na_tys) %>%
+    pivot_longer(cols = everything(), names_to = "Zmienna", values_to = "Wartość") %>%
+  mutate(
+    Zmienna = factor(Zmienna, levels = c(
+      "stopa_bezrobocia", 
+      "wynagrodzenie_brutto", 
+      "dzieci_na_placowke", 
+      "wspolczynnik_feminizacji", 
+      "wspolczynnik_urbanizacji", 
+      "saldo_migracji_na_tys"
+    ))
+  )
+
+plot_histograms <- ggplot(df_long_hist, aes(x = Wartość)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "pink", alpha = 0.8) +
+    geom_density(color = "purple", linewidth = 1) +
+    facet_wrap(~ Zmienna, scales = "free", ncol = 3) +
+    labs(
+        y = "Gęstość"
+    ) +
+    theme_minimal() +
+    theme(strip.text = element_text(face = "bold"))
+
+print(plot_histograms)
+```
+
+
+Boxploty
+```{r}
+df_long <- df_final %>%
+  dplyr::select(stopa_bezrobocia, wynagrodzenie_brutto, dzieci_na_placowke, 
+         wspolczynnik_feminizacji, wspolczynnik_urbanizacji, saldo_migracji_na_tys) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Zmienna",
+    values_to = "Wartość"
+  ) %>%
+  mutate(
+    Zmienna = factor(Zmienna, levels = c(
+      "stopa_bezrobocia", 
+      "wynagrodzenie_brutto", 
+      "dzieci_na_placowke", 
+      "wspolczynnik_feminizacji", 
+      "wspolczynnik_urbanizacji", 
+      "saldo_migracji_na_tys"
+    ))
+  )
+
+# Boxploty w układzie 2x3
+ggplot(df_long, aes(x = "", y = Wartość)) +
+  stat_boxplot(geom = "errorbar", width = 0.2) +   # poziome wąsy
+  geom_boxplot(
+    fill = "lightpink",
+    outlier.color = "red",
+    outlier.shape = 21,
+    width = 0.3
+  ) +
+  facet_wrap(~ Zmienna, ncol = 3, scales = "free_y") + # 3 kolumny -> 2 rzędy
+  theme_minimal() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+
+outliery
+ze wzgledu na wiele wartosci odstajacych usuwamy tylko najbardziej odstajace za pomoca IQR (Q1-3IQR, Q3+3IQR)
+```{r}
+cap_outliers_3iqr <- function(df, col_name) {
+    
+    #kwartyle i iqr
+    Q1 <- quantile(df[[col_name]], 0.25, na.rm = TRUE)
+    Q3 <- quantile(df[[col_name]], 0.75, na.rm = TRUE)
+    IQR_val <- Q3 - Q1
+    
+    #granice
+    lower_bound <- Q1 - (3 * IQR_val)
+    upper_bound <- Q3 + (3 * IQR_val)
+        modified_rows <- which(df[[col_name]] < lower_bound | df[[col_name]] > upper_bound)
+
+        
+    modified_count <- sum(df[[col_name]] < lower_bound | df[[col_name]] > upper_bound, na.rm = TRUE)
+    
+#zastąpienie wartości granicznych 
+    df_capped <- df %>%
+        mutate(
+            # Jeśli wartosć < dolna granica, ustaw dolna granice
+            !!sym(col_name) := ifelse(!!sym(col_name) < lower_bound, lower_bound, !!sym(col_name)),
+            # Jeśli wartość > gona granica, ustaw gorna granice
+            !!sym(col_name) := ifelse(!!sym(col_name) > upper_bound, upper_bound, !!sym(col_name))
+        )
+    
+        return(list(df = df_capped, count = modified_count, rows = modified_rows))
+
+}
+
+
+cols_to_check <- c("stopa_bezrobocia", "wynagrodzenie_brutto", "saldo_migracji_na_tys",
+                   "wspolczynnik_feminizacji", "dzieci_na_placowke", "wspolczynnik_urbanizacji")
+
+total_modified_values <- 0
+modified_rows_list <- list()  # lista do przechowania wierszy
+
+df_final_clean <- df_final
+for (col in cols_to_check) {
+    result <- cap_outliers_3iqr(df_final_clean, col)
+    df_final_clean <- result$df 
+    total_modified_values <- total_modified_values + result$count
+    modified_rows_list[[col]] <- result$rows
+    if (length(result$rows) > 0) {
+        cat("Zmiana w kolumnie:", col,  "\n")
+    }
+}
+
+
+cat(paste0("Łączna liczba zmodyfikowanych wartości: ", total_modified_values, "\n"))
+cat(paste0("Zmiany wystąpiły w liczbie wierszy: ", length(unique(unlist(modified_rows_list))), "\n"))
+
+```
+Zastąpiono 20 wartości - każda w innym powiecie
+
+#DANE PO ZASTAPIENIU OUTLIEROW
+statystyki opisowe
+```{r}
+describe(df_final_clean[,3:8])
+```
+
+
+Histogramy 
+```{r}
+data <- df_final_clean
+df_long_hist <- data %>%
+    dplyr::select(stopa_bezrobocia, wynagrodzenie_brutto, dzieci_na_placowke, 
+           wspolczynnik_feminizacji, wspolczynnik_urbanizacji, saldo_migracji_na_tys) %>%
+    pivot_longer(cols = everything(), names_to = "Zmienna", values_to = "Wartość") %>%
+  mutate(
+    Zmienna = factor(Zmienna, levels = c(
+      "stopa_bezrobocia", 
+      "wynagrodzenie_brutto", 
+      "dzieci_na_placowke", 
+      "wspolczynnik_feminizacji", 
+      "wspolczynnik_urbanizacji", 
+      "saldo_migracji_na_tys"
+    ))
+  )
+
+plot_histograms <- ggplot(df_long_hist, aes(x = Wartość)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "pink", alpha = 0.8) +
+    geom_density(color = "purple", linewidth = 1) +
+    facet_wrap(~ Zmienna, scales = "free", ncol = 3) +
+    labs(
+        y = "Gęstość"
+    ) +
+    theme_minimal() +
+    theme(strip.text = element_text(face = "bold"))
+
+print(plot_histograms)
+```
+
+#Korelacja
+```{r}
+cols_to_analyze <- c("stopa_bezrobocia", 
+      "wynagrodzenie_brutto", 
+      "dzieci_na_placowke", 
+      "wspolczynnik_feminizacji", 
+      "wspolczynnik_urbanizacji", 
+      "saldo_migracji_na_tys")
+
+cor_matrix <- cor(df_final_clean[, cols_to_analyze])
+
+print(round(cor_matrix, 3))
+
+cor_df <- as.data.frame(cor_matrix)
+cor_df$Var1 <- rownames(cor_df)
+cor_long <- cor_df %>%
+    pivot_longer(cols = -Var1, names_to = "Var2", values_to = "Correlation")
+
+plot_heatmap <- ggplot(cor_long, aes(x = Var1, y = Var2, fill = Correlation)) +
+    geom_tile(color = "white") + 
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                         midpoint = 0, limit = c(-1, 1), space = "Lab",
+                         name = "Korelacja") +
+    geom_text(aes(label = round(Correlation, 2)), color = "black", size = 3) +
+    
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 9),
+          axis.text.y = element_text(size = 9),
+          axis.title = element_blank(),
+          plot.title = element_text(hjust = 0.5)) +
+    coord_fixed() 
+
+print(plot_heatmap)
+```
+
+VIF
+```{r}
+data <- df_final_clean[,3:8]
+model <- lm(stopa_bezrobocia~ ., data = data)
+# Calculate VIF
+vif_results <- car::vif(model)
+print(vif_results)
+```
+
+feminizacja nie bedzie brana pod uwage ze wzgledu na wysoka korelacje ze zmienna wspolczynnik_urbanizacji 
+
+#Model bez zmiennej feminizacja
+```{r}
+model2 <- lm(stopa_bezrobocia ~ wynagrodzenie_brutto + saldo_migracji_na_tys + wspolczynnik_urbanizacji + dzieci_na_placowke, data = data)
+vif_result <- car::vif(model2)
+print(vif_result)
+
+print(summary(model2))
+```
+Brak problemu ze współliniowością
+
+#Koncowy model
+```{r}
+model <- lm(stopa_bezrobocia ~ wynagrodzenie_brutto + saldo_migracji_na_tys + dzieci_na_placowke + wspolczynnik_urbanizacji, data = data)
+
+print(summary(model))
+```
+
+
+#Test na autokorelacje przestrzenną
+```{r}
+df_final_clean_spatial <- df_final_spatial %>% 
+  left_join(df_final_clean, by = "Kod") 
+
+```
+
+```{r}
+set.seed(123)
+resid_model <- residuals(model)
+neigh <- poly2nb(df_final_clean_spatial)   
+listw <- nb2listw(neigh, style="W") # standaryzacja wierszy
+```
+
+
+Testy Morana - różne macierze wag (1 stopnia)
+
+a) Macierz binarna 
+```{r}
+set.seed(123)
+# Test permutacyjny 
+moran_perm <- moran.mc(resid_model, listw, nsim=999, alternative='two.sided')
+# Wynik
+moran_perm$statistic      
+moran_perm$p.value 
+
+```
+
+b) k najbliższych sąsiadów
+```{r}
+coords <- st_coordinates(st_centroid(df_final_clean_spatial))  # współrzędne centroidów
+knn7 <- knearneigh(coords, k=7)
+nb_knn7 <- knn2nb(knn7)
+listw_knn7 <- nb2listw(nb_knn7, style="W")
+
+```
+
+c) Macierz odległości
+```{r}
+nb_dist <- dnearneigh(coords, d1=0, d2=50000)  
+listw_dist <- nb2listw(nb_dist, style="W")
+```
+
+
+d) Odwrotność odległości
+```{r}
+dist_matrix <- as.matrix(dist(coords))  # euklidesowe odległości
+inv_dist <- 1 / dist_matrix
+diag(inv_dist) <- 0  
+listw_invdist <- mat2listw(inv_dist, style="W")  # standaryzacja wierszami
+```
+
+e) Kwadrat odwrotnosci
+```{r}
+# macierz odległości (centroidy)
+dist_matrix <- as.matrix(dist(coords))  
+
+# odwrotność kwadratu odległości
+inv_dist2 <- 1 / (dist_matrix^2)
+
+# własne jednostki mają wagę 0
+diag(inv_dist2) <- 0  
+
+# zamiana na listw
+listw_invdist2 <- mat2listw(inv_dist2, style="W")  # standaryzacja wierszami
+```
+
+
+Test permutacyjny na tych 5 macierzach
+```{r}
+test_moran <- function(residuals, listw, nsim=999){
+  set.seed(123)  # <- tutaj, dla powtarzalności permutacji
+  moran <- moran.mc(residuals, listw, nsim=nsim, alternative="two.sided")
+  data.frame(Moran_I = moran$statistic, p_value = moran$p.value)
+}
+
+
+lists <- list(
+  Binarna    = listw,
+  KNN       = listw_knn7,
+  Dist50km   = listw_dist,
+  InvDist    = listw_invdist,
+  InvDist2   = listw_invdist2
+)
+
+
+results <- lapply(lists, function(lw) test_moran(resid_model, lw))
+results_df <- do.call(rbind, results)
+results_df <- cbind(Macierz = rownames(results_df), results_df)
+rownames(results_df) <- NULL
+
+options(digits = 5)  
+
+print(results_df)
+
+```
